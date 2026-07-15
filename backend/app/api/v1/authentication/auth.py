@@ -1,0 +1,158 @@
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+from app.schemas.common import ApiResponse
+from app.schemas.superadmin import LoginData, LoginResponse, SuperAdminCreate, TokenResponse,LoginRequest
+from app.models import User, UserRole
+from app.api.deps import get_db
+from app.utils.auth_helper import create_access_token, validate_password,hash_password, verify_password
+from sqlalchemy.exc import SQLAlchemyError
+import logging
+
+router = APIRouter()
+
+MAX_FAILED_LOGIN_ATTEMPTS = 5
+
+@router.post("/create-superadmin", status_code=status.HTTP_201_CREATED)
+def create_super_admin(payload: SuperAdminCreate, db:Session = Depends(get_db)):
+
+    existing_admin = db.query(User).filter(
+        User.role == UserRole.SUPER_ADMIN
+    ).first()
+
+    if existing_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super Admin already exists"
+        )
+    
+    try:
+        validate_password(payload.password)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if db.query(User).filter(
+        (User.email == payload.email) |
+        (User.mobile_no == payload.mobile_no)
+    ).first():
+        raise HTTPException(
+            status_code=400,
+            detail="email already exists"
+        )       
+
+    super_admin = User(
+        email=payload.email,
+        mobile_no=payload.mobile_no,
+        hashed_password=hash_password(payload.password),
+        full_name=payload.full_name,
+        role=UserRole.SUPER_ADMIN,
+        is_active=True,
+        is_2fa_enabled=False,
+        failed_login_attempts=0,
+        tenant_id=None,
+        is_super_admin=True
+    )    
+
+    db.add(super_admin)
+    db.commit()
+    db.refresh(super_admin)
+
+    return {
+       "data":{
+            "status": status.HTTP_201_CREATED,
+        "message":"Super Admin created succesfully",
+        "email":super_admin.email,
+        "role": super_admin.role,
+        "tenant_id":super_admin.tenant_id,
+        "user_id":super_admin.id
+       }
+    }
+
+# for swagger authentication
+@router.post("/login", response_model=LoginResponse,status_code=status.HTTP_200_OK)
+def superadmin_login(
+    payload: LoginRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+    
+            email = payload.email  #username == email
+            password = payload.password
+
+            user = db.query(User).filter(User.email == email).first()
+
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid credentials",
+                )
+            
+            if not user.is_active:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Account is locked due to multiple failed login attempts"
+                )
+            
+            if not user.is_active:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Inactive account"
+                )
+            
+            if not verify_password(password, user.hashed_password):
+                user.failed_login_attempts += 1
+
+                if user.failed_login_attempts >= MAX_FAILED_LOGIN_ATTEMPTS:
+                    user.is_active = False
+
+                db.commit()    
+
+                remaining = max(
+                    0, MAX_FAILED_LOGIN_ATTEMPTS - user.failed_login_attempts
+                )
+
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=(
+                        "Invalid credentials"
+                        if remaining == 0
+                        else f"Invalid credentials. {remaining} attempts remaining"
+                    ),
+                )
+            user.failed_login_attempts = 0
+            user.last_login = datetime.utcnow()
+            db.commit()
+            
+            access_token = create_access_token(
+                data={
+            "sub": str(user.id),
+            "role": user.role,
+            "tenant_id": str(user.tenant_id) if user.tenant_id else None
+        }
+            )
+
+            return {
+                "success": True,
+                "status_code": 200,
+                "message": "Login successful",
+                "data": {
+                    "access_token": access_token,
+                    "token_type": "bearer",
+                    "role": user.role,
+                    "tenant_id": user.tenant_id,
+                    "user_id": user.id
+                }
+    }
+    except HTTPException:
+        raise
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Login failed due to a server error"
+        )
+   
+
+    
