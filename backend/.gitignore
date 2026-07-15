@@ -85,5 +85,3 @@ dist/
 *.crt
 
 script.py
-Dockerfile
-docker-compose-local.yml
